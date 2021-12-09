@@ -27,12 +27,22 @@
  */
 
 #include <windows.h>
-#include <tlhelp32.h>
 #include <limits.h>
 
 #include "../include/MinHook.h"
 #include "buffer.h"
 #include "trampoline.h"
+
+typedef NTSTATUS(NTAPI* _NtGetNextThread)(
+    _In_ HANDLE ProcessHandle,
+    _In_ HANDLE ThreadHandle,
+    _In_ ACCESS_MASK DesiredAccess,
+    _In_ ULONG HandleAttributes,
+    _In_ ULONG Flags,
+    _Out_ PHANDLE NewThreadHandle
+    );
+
+static _NtGetNextThread nextThread = NULL;
 
 #ifndef ARRAYSIZE
     #define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
@@ -264,60 +274,56 @@ static BOOL EnumerateThreads(PFROZEN_THREADS pThreads)
 {
     BOOL succeeded = FALSE;
 
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnapshot != INVALID_HANDLE_VALUE)
+    HANDLE hProc = GetCurrentProcess();
+    HANDLE hThread = NULL;
+
+    DWORD currentThreadId = GetCurrentThreadId();
+    while (nextThread(hProc, hThread, MAXIMUM_ALLOWED, 0, 0, &hThread) == 0)
     {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(THREADENTRY32);
-        if (Thread32First(hSnapshot, &te))
+        if (!hThread)
         {
-            succeeded = TRUE;
-            do
+            continue;
+        }
+
+        DWORD threadId = GetThreadId(hThread);
+        if (threadId == currentThreadId)
+        {
+            continue;
+        }
+
+        succeeded = TRUE;
+
+        if (pThreads->pItems == NULL)
+        {
+            pThreads->capacity = 128;
+            pThreads->pItems
+                = (LPDWORD)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
+            if (pThreads->pItems == NULL)
             {
-                if (te.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD))
-                    && te.th32OwnerProcessID == GetCurrentProcessId()
-                    && te.th32ThreadID != GetCurrentThreadId())
-                {
-                    if (pThreads->pItems == NULL)
-                    {
-                        pThreads->capacity = INITIAL_THREAD_CAPACITY;
-                        pThreads->pItems
-                            = (LPDWORD)HeapAlloc(g_hHeap, 0, pThreads->capacity * sizeof(DWORD));
-                        if (pThreads->pItems == NULL)
-                        {
-                            succeeded = FALSE;
-                            break;
-                        }
-                    }
-                    else if (pThreads->size >= pThreads->capacity)
-                    {
-                        pThreads->capacity *= 2;
-                        LPDWORD p = (LPDWORD)HeapReAlloc(
-                            g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(DWORD));
-                        if (p == NULL)
-                        {
-                            succeeded = FALSE;
-                            break;
-                        }
-
-                        pThreads->pItems = p;
-                    }
-                    pThreads->pItems[pThreads->size++] = te.th32ThreadID;
-                }
-
-                te.dwSize = sizeof(THREADENTRY32);
-            } while (Thread32Next(hSnapshot, &te));
-
-            if (succeeded && GetLastError() != ERROR_NO_MORE_FILES)
                 succeeded = FALSE;
-
-            if (!succeeded && pThreads->pItems != NULL)
-            {
-                HeapFree(g_hHeap, 0, pThreads->pItems);
-                pThreads->pItems = NULL;
+                break;
             }
         }
-        CloseHandle(hSnapshot);
+        else if (pThreads->size >= pThreads->capacity)
+        {
+            pThreads->capacity *= 2;
+            LPDWORD p = (LPDWORD)HeapReAlloc(
+                g_hHeap, 0, pThreads->pItems, pThreads->capacity * sizeof(DWORD));
+            if (p == NULL)
+            {
+                succeeded = FALSE;
+                break;
+            }
+
+            pThreads->pItems = p;
+        }
+        pThreads->pItems[pThreads->size++] = threadId;
+    }
+
+    if (!succeeded && pThreads->pItems != NULL)
+    {
+        HeapFree(g_hHeap, 0, pThreads->pItems);
+        pThreads->pItems = NULL;
     }
 
     return succeeded;
@@ -515,6 +521,12 @@ MH_STATUS WINAPI MH_Initialize(VOID)
         status = MH_ERROR_ALREADY_INITIALIZED;
     }
 
+    if (nextThread == NULL)
+    {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        nextThread = (_NtGetNextThread)GetProcAddress(ntdll, "NtGetNextThread");
+    }
+	
     LeaveSpinLock();
 
     return status;
